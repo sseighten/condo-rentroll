@@ -1,13 +1,13 @@
-# RentRoll — a launch mode for Stonk.fun reward coins
+# RentRoll — a launch mode for Stonk.fun
 
 **Designed by the CONDO team (@CONDOonSol). Public specification, November 2026.**
 
-RentRoll is a token-level rule for Stonk.fun reward coins:
+RentRoll is a token-level rule for Stonk.fun launches. It works on both reward launches and standard launches:
 
 - **Every incoming transfer is locked.** Any buy, from any route, and any wallet-to-wallet send creates a lock on the amount received. Locked tokens cannot be sold or sent until the lock ends.
 - **Each lock length is random and secret.** It is drawn from public randomness and a secret committed in advance by the holder, so only the holder can compute when it ends. Its possible range is public; its exact end is not.
 - **Bigger buys get wider ranges.** The maximum lock scales with the buy's share of supply, measured against a pool-wide rolling window.
-- **The reward tax follows time held.** The reward Stonk.fun already distributes in the quote asset is split by *balance × time held*.
+- **Rewards are optional.** If the creator turns on Stonk.fun's reward tax, the reward distributed in the quote asset is split by *balance × time held*. Without it, the lock works the same way.
 - **Locks can be transferred.** A holder can sell a locked position to another wallet, which inherits the remaining lock.
 
 The rule is enforced by a Token-2022 transfer hook, so it applies on every route: the Stonk.fun UI, an aggregator, a direct pool swap, or a plain transfer.
@@ -18,7 +18,7 @@ The rule is enforced by a Token-2022 transfer hook, so it applies on every route
 
 ## 1. Prior art
 
-Per-buy locks enforced through transfer hooks already exist on Solana (for example Lockd, Hooked and Hooker in 2026), as do fixed per-buy locks such as $HUNDRED, and randomized vesting was proposed by ChainSafe in 2024. To our knowledge, RentRoll's combination is new: a random lock on every incoming transfer, scaled by size, with an end known only to the holder, plus a time-weighted reward split and transferable locked positions.
+Per-buy locks enforced through transfer hooks already exist on Solana (for example Lockd, Hooked and Hooker in 2026), as do fixed per-buy locks such as $HUNDRED, and randomized vesting was proposed by ChainSafe in 2024. To our knowledge, RentRoll's combination is new: a random lock on every incoming transfer, scaled by size, with an end known only to the holder, plus transferable locked positions and an optional time-weighted reward split.
 
 ## 2. What it needs from Raydium and aggregators
 
@@ -30,7 +30,7 @@ Stonk.fun launches on Raydium LaunchLab and graduates to Raydium CPMM. Today:
 RentRoll requires:
 
 1. **CPMM**: support for admin-enshrined hook programs, with hook extra accounts forwarded in swaps, deposits and withdrawals. This matches the design proposed in raydium-cp-swap PR #81 (a `support_hook` PDA checked at pool creation, extras passed through `remaining_accounts`).
-2. **LaunchLab**: a TransferHook option on `initialize_with_token_2022`, limited to enshrined hook programs, with extras forwarded in buy, sell and migration.
+2. **LaunchLab**: a TransferHook option on `initialize_with_token_2022`, limited to enshrined hook programs, with extras forwarded in buy, sell and migration. It must work with and without TransferFeeConfig, since rewards are optional.
 3. **Graduation**: automatic `support_mint` and `support_hook` registration for RentRoll mints when they migrate to CPMM.
 4. **Deterministic, documented vault addresses** for LaunchLab and CPMM pools, so the hook can exempt exact accounts (section 5).
 5. **Aggregators**: Jupiter routing for enshrined-hook mints. Until then, RentRoll tokens trade on Stonk.fun and Raydium only.
@@ -38,7 +38,7 @@ RentRoll requires:
 ## 3. Mint
 
 - Token-2022, 1B supply, 6 decimals.
-- Extensions: TransferFeeConfig (the existing reward tax), TransferHook (the RentRoll program), MetadataPointer and TokenMetadata.
+- Extensions: TransferHook (the RentRoll program), MetadataPointer and TokenMetadata. Reward launches also carry TransferFeeConfig (Stonk.fun's existing reward tax); standard launches do not.
 - Mint authority and freeze authority set to none.
 - The hook program is immutable after audit, or held by a multisig behind a public timelock. Per-launch parameters are frozen at creation.
 
@@ -61,14 +61,14 @@ Token-2022 calls the hook after balances are updated. The hook first checks that
 
 **Outgoing (source is not exempt):** the source account's balance after the transfer must be at least the sum of its active locks. A lock is active until it is unlocked (section 7) or until `start + max_lock`, whichever comes first.
 
-**Incoming (destination is not exempt):** create a lock entry for the **net** amount received (the amount minus the transfer fee):
+**Incoming (destination is not exempt):** create a lock entry for the **net** amount received (the amount minus the transfer fee on reward launches; the full amount on standard launches):
 
 ```
 entry = { amount_net, start_slot, start_time, min_lock, max_lock,
           secret_index (or none), status: Pending }
 ```
 
-**Exempt accounts:** the exact vault token accounts of the official pool, never a pool authority. Every CPMM pool shares one authority PDA, so exempting the authority would open any unofficial pool. The LaunchLab vault is recorded at creation. The CPMM vault is recorded once at graduation by a permissionless instruction that verifies the pool created by the migration. Stonk.fun's fee-distribution account is also exempt.
+**Exempt accounts:** the exact vault token accounts of the official pool, never a pool authority. Every CPMM pool shares one authority PDA, so exempting the authority would open any unofficial pool. The LaunchLab vault is recorded at creation. The CPMM vault is recorded once at graduation by a permissionless instruction that verifies the pool created by the migration. On reward launches, Stonk.fun's fee-distribution account is also exempt.
 
 **Unofficial pools cannot bypass the rule:** tokens deposited into any other pool's vault are locked like any wallet's, and every buyer that pool pays receives a new lock.
 
@@ -101,9 +101,11 @@ A slot leader could bias one slot hash by skipping its slot. It cannot choose a 
 
 What others can see: each entry's amount, start and range. What they cannot see: when a secret lock ends, until its holder moves the tokens.
 
-## 8. Reward split
+## 8. Reward split (reward launches only)
 
-Stonk.fun's distributor already pays the reward tax to holders in the quote asset. In RentRoll mode it weights each holder by **balance × time held** over the distribution period:
+The creator chooses whether a RentRoll launch carries Stonk.fun's reward tax. On a standard launch there is no tax to distribute, and this section does not apply: the lock, the secret lengths and locked-position sales work exactly the same.
+
+On a reward launch, Stonk.fun's distributor already pays the tax to holders in the quote asset. In RentRoll mode it weights each holder by **balance × time held** over the distribution period:
 
 ```
 w_i = Σ balance_i(t) × Δt
@@ -123,17 +125,17 @@ Native wallet "Send" buttons do not pass hook accounts. Transfers and listings g
 
 ## 10. What Stonk.fun runs
 
-1. A "RentRoll" platform config: reward launch with the RentRoll hook.
+1. A "RentRoll" option on both launch types: reward and standard, each with the RentRoll hook.
 2. UI flows: enable secret locks (sign, register root), buy (prepend page instruction when needed), unlock, send, list and buy positions.
 3. A keeper: settles entries, keeps page headroom, records the CPMM vault at graduation.
-4. Distributor weighting by balance × time held, with exclusions.
+4. On reward launches: distributor weighting by balance × time held, with exclusions.
 
 ## 11. Open questions
 
 1. Will Raydium enshrine an audited RentRoll hook in LaunchLab and CPMM (section 2)?
-2. Does Stonk.fun's distributor currently pay program-owned accounts?
+2. On reward launches: does Stonk.fun's distributor currently pay program-owned accounts?
 3. Compute cost of the hook on LaunchLab and CPMM swaps, within limits shared with Raydium's own accounts.
 4. Exact deterministic seeds of LaunchLab and CPMM vault accounts.
 5. Which wallets sign the secret message deterministically (Phantom, Solflare, Backpack, Ledger, MPC wallets).
 6. Page sizing and rent per launch.
-7. Whether withdrawing withheld transfer fees invokes the hook on Stonk.fun's current flow.
+7. On reward launches: whether withdrawing withheld transfer fees invokes the hook on Stonk.fun's current flow.
