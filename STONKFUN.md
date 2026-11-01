@@ -7,7 +7,8 @@ RentRoll is a token-level rule for Stonk.fun launches. It works on both reward l
 - **Every incoming transfer is locked.** Any buy, from any route, and any wallet-to-wallet send creates a lock on the amount received. Locked tokens cannot be sold or sent until the lock ends.
 - **Each lock length is random and secret.** It is drawn from public randomness and a secret committed in advance by the holder, so only the holder can compute when it ends. Its possible range is public; its exact end is not.
 - **Bigger buys get wider ranges.** The maximum lock scales with the buy's share of supply, measured against a pool-wide rolling window.
-- **Rewards are untouched.** The creator turns Stonk.fun's buy/sell reward tax on or off as usual, and Stonk.fun distributes it exactly as it does today. RentRoll works the same either way.
+- **Long locks get a bonus.** Past a minimum lock time, every extra day adds a bonus in the coin's own tokens, paid when the lock ends, from a reserve the creator sets aside at launch.
+- **Stonk.fun's reward tax is untouched.** The creator turns the buy/sell reward tax on or off as usual, and Stonk.fun distributes it exactly as it does today. RentRoll works the same either way.
 - **Locks can be transferred.** A holder can sell a locked position to another wallet, which inherits the remaining lock.
 
 The rule is enforced by a Token-2022 transfer hook, so it applies on every route: the Stonk.fun UI, an aggregator, a direct pool swap, or a plain transfer.
@@ -18,7 +19,7 @@ The rule is enforced by a Token-2022 transfer hook, so it applies on every route
 
 ## 1. Prior art
 
-Per-buy locks enforced through transfer hooks already exist on Solana (for example Lockd, Hooked and Hooker in 2026), as do fixed per-buy locks such as $HUNDRED, and randomized vesting was proposed by ChainSafe in 2024. To our knowledge, RentRoll's combination is new: a random lock on every incoming transfer, scaled by size, with an end known only to the holder, plus transferable locked positions.
+Per-buy locks enforced through transfer hooks already exist on Solana (for example Lockd, Hooked and Hooker in 2026), as do fixed per-buy locks such as $HUNDRED, and randomized vesting was proposed by ChainSafe in 2024. To our knowledge, RentRoll's combination is new: a random lock on every incoming transfer, scaled by size, with an end known only to the holder, an unlock bonus that grows with lock time, and transferable locked positions.
 
 ## 2. What it needs from Raydium and aggregators
 
@@ -50,8 +51,9 @@ RentRoll requires:
 | `LockPage` | `["page", mint, owner[0]]` | Lock entries for every wallet whose owner pubkey starts with that byte (256 pages per mint) |
 | `SecretRoot` | `["secret", mint, owner]` | Optional. The holder's Merkle root of per-lock commitments |
 | `Listing` | `["listing", mint, owner, entry]` | Optional. A locked position offered for sale |
+| `BonusVault` | `["bonus", mint]` | Token account holding the bonus reserve (section 9). Can only pay bonuses |
 
-A transfer hook has no payer and cannot create accounts. `LockPage` accounts are therefore created and grown by a permissionless instruction that any payer can call. The Stonk.fun buy flow prepends it when a page is missing or near capacity, and a keeper keeps headroom. A transfer whose page is missing or full fails, so no transfer can skip its lock. Expired entries are evicted to reuse space.
+A transfer hook has no payer and cannot create accounts. `LockPage` accounts are therefore created and grown by a permissionless instruction that any payer can call. The Stonk.fun buy flow prepends it when a page is missing or near capacity, and a keeper keeps headroom. A transfer whose page is missing or full fails, so no transfer can skip its lock. Expired entries are evicted to reuse space, except entries with an unclaimed bonus, which stay until claimed or until `bonus_claim_window` has passed.
 
 The hook resolves accounts through its `ExtraAccountMetaList`: `Config`, the source owner's page and the destination owner's page (seeded from the first byte of each token account's `owner` field), and the destination owner's `SecretRoot`.
 
@@ -68,11 +70,13 @@ entry = { amount_net, start_slot, start_time, min_lock, max_lock,
           secret_index (or none), status: Pending }
 ```
 
-**Exempt accounts:** the exact vault token accounts of the official pool, never a pool authority. Every CPMM pool shares one authority PDA, so exempting the authority would open any unofficial pool. The LaunchLab vault is recorded at creation. The CPMM vault is recorded once at graduation by a permissionless instruction that verifies the pool created by the migration. On reward launches, Stonk.fun's fee-distribution account is also exempt.
+**No new lock** is created for a bonus payout (source is the `BonusVault`) or for a locked-position sale (section 10), which moves an existing entry instead.
+
+**Exempt accounts:** the exact vault token accounts of the official pool and the `BonusVault`, never a pool authority. Every CPMM pool shares one authority PDA, so exempting the authority would open any unofficial pool. The LaunchLab vault is recorded at creation. The CPMM vault is recorded once at graduation by a permissionless instruction that verifies the pool created by the migration. On reward launches, Stonk.fun's fee-distribution account is also exempt.
 
 **Unofficial pools cannot bypass the rule:** tokens deposited into any other pool's vault are locked like any wallet's, and every buyer that pool pays receives a new lock.
 
-**Entry limit:** each wallet holds at most 8 active entries. When all 8 are in use, a new amount goes into an overflow entry that unlocks at the latest `start + max_lock` of everything merged into it. Overflow never shortens a lock; it only removes the randomness for that amount.
+**Entry limit:** each wallet holds at most 8 active entries. When all 8 are in use, a new amount goes into an overflow entry that unlocks at the latest `start + max_lock` of everything merged into it. Overflow never shortens a lock; it only removes the randomness for that amount, and overflow entries earn no bonus.
 
 ## 6. Lock length
 
@@ -81,7 +85,7 @@ Parameters per launch (public, frozen at creation): `min_lock`, size tiers `(sha
 1. **Size**: `own = amount_net × 10^6 / supply`.
 2. **Pool-wide window**: one volume counter per mint, reset when `window_slots` have passed since the window opened. `effective = max(own, window_volume × window_weight_pct / 100)`. It catches bursts and bundles landing in the same short window. It does not link wallets.
 3. **Range**: `max_lock = interpolate(effective, tiers)`, clamped to `[min_lock, global_max_lock]`.
-4. **Randomness**, without an oracle: `r = SlotHash(start_slot + settle_delay)` (or of the first non-skipped slot after it), read from the SlotHashes sysvar by a permissionless `settle` instruction. If nobody settles before that slot hash leaves the sysvar (about 512 slots), the entry takes `max_lock`. Holding back a settlement can only lengthen a lock.
+4. **Randomness**, without an oracle: `r = SlotHash(start_slot + settle_delay)` (or of the first non-skipped slot after it), read from the SlotHashes sysvar by a permissionless `settle` instruction. If nobody settles before that slot hash leaves the sysvar (about 512 slots), the entry takes `max_lock` and earns no bonus. Holding back a settlement can only lengthen a lock and can never raise a bonus.
 5. **Draw**: `u = H(r ‖ key) / 2^256`, then `lock = min_lock + (max_lock − min_lock) × u²`, skewed toward short locks (median at 25% of the range).
    - With a secret: `key = s_k`, the holder's per-lock secret (section 7).
    - Without one: `key = mint ‖ owner ‖ entry_id`, and `settle` stores the end time publicly.
@@ -101,30 +105,60 @@ A slot leader could bias one slot hash by skipping its slot. It cannot choose a 
 
 What others can see: each entry's amount, start and range. What they cannot see: when a secret lock ends, until its holder moves the tokens.
 
-## 8. Rewards
+## 8. Stonk.fun's reward tax
 
-RentRoll does not change Stonk.fun's rewards. The creator chooses a reward launch (buy/sell tax redistributed to holders) or a standard launch, as today, and adds RentRoll to either one.
+RentRoll does not change Stonk.fun's reward tax. The creator chooses a reward launch (buy/sell tax redistributed to holders) or a standard launch, as today, and adds RentRoll to either one. The unlock bonus (section 9) is separate and comes from its own reserve.
 
 On a reward launch, Stonk.fun's distributor keeps working exactly as it does now. Locked tokens stay in the holder's own wallet, so they count like any other balance. The only requirement on RentRoll's side is that the hook never blocks Stonk.fun's fee flow (section 5).
 
-## 9. Selling a locked position
+## 9. Unlock bonus
+
+A long lock is not just a cost: past a threshold, it pays a bonus.
+
+**Reserve.** At launch, the creator sets aside a share of supply (`bonus_reserve`, within a minimum and maximum set by Stonk.fun, for example 3 to 5%) in the `BonusVault`, either from a creator allocation or from tokens bought at launch and deposited. Anyone can add to it. Nobody can withdraw from it: it only pays bonuses.
+
+**Parameters per launch** (public, frozen at creation): `bonus_threshold` (for example 3 days), `bonus_rate` (share of the locked amount per day beyond the threshold, for example 1%), `bonus_cap_mult` (for example 5: a claim can take at most 5 × its amount's share of supply, as a share of the vault), `bonus_claim_window` (for example 30 days after unlock).
+
+**Amount.** For an entry with drawn lock length `L`:
+
+```
+days_over = max(0, L − bonus_threshold) / 1 day
+bonus = amount_net × bonus_rate × days_over
+cap   = vault_balance × bonus_cap_mult × amount_net / supply
+paid  = min(bonus, cap)
+```
+
+Below the threshold there is no bonus. Above it, the bonus grows linearly with each extra day. A 21-day lock with the example values pays up to 18% of the locked amount.
+
+The cap is proportional to the amount, so splitting a buy cannot get around it, and no single claim can drain the reserve. As the reserve shrinks, payouts shrink with it.
+
+**Claim.** The holder calls `claim_bonus(entry)` once the lock has ended: with a secret lock, together with `unlock` (section 7), which reveals the length at that point; with a public lock, after its stored end. The bonus is paid unlocked. Each entry can claim once.
+
+**No bonus for:** entries that timed out without settlement (section 6), overflow entries (section 5), and claims after `bonus_claim_window`.
+
+**Splitting does not pay.** Smaller buys draw from shorter ranges, so splitting one buy across many wallets means fewer days past the threshold and a smaller total bonus.
+
+**Empty vault.** When the reserve runs out, bonuses stop and the lock keeps working as before.
+
+## 10. Selling a locked position
 
 1. The holder lists an entry at a price in the quote asset and approves the RentRoll program as delegate for that amount.
 2. A buyer calls `buy_listing`. The program marks the entry in the seller's page for this buyer and amount, then transfers the tokens as delegate. The hook finds the mark and **moves the entry** (amount, start, range, randomness) to the buyer instead of creating a new lock.
 3. For a secret lock, the seller either reveals `s_k` in the listing (the end becomes public) or sends it privately to a named buyer, who checks it against the seller's commitment.
-4. Tokens never touch a pool, so the price does not move.
+4. The buyer inherits the entry's future bonus.
+5. Tokens never touch a pool, so the price does not move.
 
 Native wallet "Send" buttons do not pass hook accounts. Transfers and listings go through the Stonk.fun token page.
 
-## 10. What Stonk.fun runs
+## 11. What Stonk.fun runs
 
-1. A "RentRoll" option on both launch types: reward and standard, each with the RentRoll hook.
-2. UI flows: enable secret locks (sign, register root), buy (prepend page instruction when needed), unlock, send, list and buy positions.
+1. A "RentRoll" option on both launch types: reward and standard, each with the RentRoll hook and a bonus reserve funded at launch.
+2. UI flows: enable secret locks (sign, register root), buy (prepend page instruction when needed), unlock and claim the bonus, send, list and buy positions.
 3. A keeper: settles entries, keeps page headroom, records the CPMM vault at graduation.
 
 Nothing changes in Stonk.fun's reward distribution.
 
-## 11. Open questions
+## 12. Open questions
 
 1. Will Raydium enshrine an audited RentRoll hook in LaunchLab and CPMM (section 2)?
 2. Compute cost of the hook on LaunchLab and CPMM swaps, within limits shared with Raydium's own accounts.
@@ -132,3 +166,4 @@ Nothing changes in Stonk.fun's reward distribution.
 4. Which wallets sign the secret message deterministically (Phantom, Solflare, Backpack, Ledger, MPC wallets).
 5. Page sizing and rent per launch.
 6. On reward launches: whether withdrawing withheld transfer fees invokes the hook on Stonk.fun's current flow.
+7. How a creator funds the bonus reserve on LaunchLab: a creator allocation, or tokens bought at launch and deposited.
