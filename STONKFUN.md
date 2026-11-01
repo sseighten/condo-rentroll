@@ -1,105 +1,139 @@
-# RentRoll — a native launch mode for Stonk.fun
+# RentRoll — a launch mode for Stonk.fun reward coins
 
 **Designed by the CONDO team (@CONDOonSol). Public specification, November 2026.**
 
-RentRoll adds two things to a Stonk.fun reward launch:
+RentRoll is a token-level rule for Stonk.fun reward coins:
 
-- **Roll a Lease**: every buy made in RentRoll mode goes into an on-chain vault under a lease of random length. Only the tenant knows when their lease ends.
-- **Collect Rent**: the reward tax that Stonk.fun already distributes in the quote asset is paid to locked positions, weighted linearly by *locked amount × time held*.
+- **Every incoming transfer is locked.** Any buy, from any route, and any wallet-to-wallet send creates a lock on the amount received. Locked tokens cannot be sold or sent until the lock ends.
+- **Each lock length is random and secret.** It is drawn from public randomness and a secret committed in advance by the holder, so only the holder can compute when it ends. Its possible range is public; its exact end is not.
+- **Bigger buys get wider ranges.** The maximum lock scales with the buy's share of supply, measured against a pool-wide rolling window.
+- **The reward tax follows time held.** The reward Stonk.fun already distributes in the quote asset is split by *balance × time held*.
+- **Locks can be transferred.** A holder can sell a locked position to another wallet, which inherits the remaining lock.
 
-A third feature, **Sublease**, lets a tenant sell a locked position to someone else without touching the pool.
+The rule is enforced by a Token-2022 transfer hook, so it applies on every route: the Stonk.fun UI, an aggregator, a direct pool swap, or a plain transfer.
+
+**Status:** design only. RentRoll needs transfer-hook support from Raydium LaunchLab and Raydium CPMM, which does not exist today (section 2). No program is deployed.
 
 ---
 
-## 1. Context: the Stonk.fun stack today
+## 1. Prior art
 
-| Piece | Today |
-|---|---|
-| Bonding curve | Raydium LaunchLab (`LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj`), pools attributed to Stonk.fun platform configs |
-| Mints | Token-2022, 1B supply, 6 decimals; reward launches carry a TransferFee extension (100 or 300 bps); no transfer hook |
-| Graduation | Raydium CPMM (`CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C`) |
-| Holder rewards | Transfer tax collected and paid to holders in the quote asset by Stonk.fun's distributor |
+Per-buy locks enforced through transfer hooks already exist on Solana (for example Lockd, Hooked and Hooker in 2026), as do fixed per-buy locks such as $HUNDRED, and randomized vesting was proposed by ChainSafe in 2024. To our knowledge, RentRoll's combination is new: a random lock on every incoming transfer, scaled by size, with an end known only to the holder, plus a time-weighted reward split and transferable locked positions.
 
-RentRoll uses all of this as-is. **No Raydium change is required.**
+## 2. What it needs from Raydium and aggregators
 
-## 2. Native integration (what Stonk.fun would run)
+Stonk.fun launches on Raydium LaunchLab and graduates to Raydium CPMM. Today:
 
-1. **A "RentRoll" platform config** on LaunchLab, configured like the existing reward config (Token-2022 + transfer fee, quote asset of the creator's choice, graduation to CPMM).
-2. **A lease vault program** (Anchor). It holds the positions and routes Roll a Lease buys by CPI:
-   - pre-graduation: LaunchLab `buy_exact_in`, with the vault token account as `user_base_token`;
-   - post-graduation: CPMM `swap_base_input`, with the vault token account as `output_token_account`.
-   The locked amount is measured as `vault_balance_after − vault_balance_before`, which is net of the Token-2022 transfer fee.
-3. **Default routing**: the Stonk.fun UI and API build "Roll a Lease" transactions by default for RentRoll launches.
-4. **Randomness keeper**: Switchboard On-Demand commit/reveal; settlement is permissionless.
-5. **Rent weighting** in the existing reward distributor (section 5).
-6. **Unlock-fee rebate (optional)**: leaving the vault is a second token transfer and pays the transfer fee again. The withheld-fee authority can rebate it, or the tenant can sell directly from the vault into the pool (one transfer, same as any sell).
+- LaunchLab's Token-2022 path rejects TransferHook on the base mint.
+- CPMM's mint allow-list rejects active transfer hooks, and its transfer helpers do not forward the extra accounts a hook needs.
 
-Buys that bypass the vault (aggregators, direct pool calls) remain possible and stay unlocked. They do not earn rent. RentRoll is therefore an incentive, not an enforcement mechanism.
+RentRoll requires:
 
-**Open avenue, not part of this design:** forcing a lease on 100% of buys would need a transfer hook (or an equivalent lock-on-buy primitive). Today's Raydium LaunchLab/CPMM do not accept mints with an active transfer hook, so this would require a change on Raydium's side.
+1. **CPMM**: support for admin-enshrined hook programs, with hook extra accounts forwarded in swaps, deposits and withdrawals. This matches the design proposed in raydium-cp-swap PR #81 (a `support_hook` PDA checked at pool creation, extras passed through `remaining_accounts`).
+2. **LaunchLab**: a TransferHook option on `initialize_with_token_2022`, limited to enshrined hook programs, with extras forwarded in buy, sell and migration.
+3. **Graduation**: automatic `support_mint` and `support_hook` registration for RentRoll mints when they migrate to CPMM.
+4. **Deterministic, documented vault addresses** for LaunchLab and CPMM pools, so the hook can exempt exact accounts (section 5).
+5. **Aggregators**: Jupiter routing for enshrined-hook mints. Until then, RentRoll tokens trade on Stonk.fun and Raydium only.
 
-## 3. Lease math (Roll a Lease)
+## 3. Mint
 
-Parameters (per launch, public): `min_lease`, size tiers `(size_ppm_k, max_lease_k)`, `window_slots`, `window_weight_pct`, `global_max_lease`, and an optional `lease_fee_bps` (a percentage of the quote amount; there is no fixed per-buy fee).
+- Token-2022, 1B supply, 6 decimals.
+- Extensions: TransferFeeConfig (the existing reward tax), TransferHook (the RentRoll program), MetadataPointer and TokenMetadata.
+- Mint authority and freeze authority set to none.
+- The hook program is immutable after audit, or held by a multisig behind a public timelock. Per-launch parameters are frozen at creation.
 
-1. **Size** of a buy, in parts per million of total supply: `own = amount × 10^6 / supply`.
-2. **Pool-wide rolling window**: the program keeps one running volume counter per pool (not per wallet). It resets once `window_slots` have passed since the window opened. Each buy adds to it.
-   `effective = max(own, window_volume × window_weight_pct / 100)`
-3. **Range**: `max_lease = interpolate(effective, tiers)`, clamped to `[min_lease, global_max_lease]`.
-4. **Draw**: with `u` uniform in `[0, 1)`, derived from the revealed randomness and the tenant's secret (section 6),
-   `lease = min_lease + (max_lease − min_lease) × u²`.
-   The draw is skewed toward short leases (median at 25% of the range).
-5. **Timeout**: if randomness is not revealed within ~150 slots, the position takes `max_lease`.
-6. **Safety net**: every position is withdrawable after `buy_time + max_lease`, with no randomness or secret needed.
+## 4. Accounts
 
-**Splitting across wallets.** The main defence is the rent formula (section 5). Rent is strictly linear in *size × time*, so splitting one buy across N wallets earns no extra rent. And because leasing is opt-in, a buyer who doesn't want a lease can simply buy without RentRoll.
+| Account | Seeds | Purpose |
+|---|---|---|
+| `Config` | `["config", mint]` | Lock parameters, exempt vault accounts, rolling-window counter |
+| `LockPage` | `["page", mint, owner[0]]` | Lock entries for every wallet whose owner pubkey starts with that byte (256 pages per mint) |
+| `SecretRoot` | `["secret", mint, owner]` | Optional. The holder's Merkle root of per-lock commitments |
+| `Listing` | `["listing", mint, owner, entry]` | Optional. A locked position offered for sale |
 
-**The pool-wide window is a secondary sizing aid, with limits.** It makes buys that land in the same short window, such as a burst or a bundle, share one size, so later slices draw from a longer lease range. Recommended `window_slots` ≈ 150 (about one minute). It does **not** link wallets: buys spread over minutes or hours are each sized on their own.
+A transfer hook has no payer and cannot create accounts. `LockPage` accounts are therefore created and grown by a permissionless instruction that any payer can call. The Stonk.fun buy flow prepends it when a page is missing or near capacity, and a keeper keeps headroom. A transfer whose page is missing or full fails, so no transfer can skip its lock. Expired entries are evicted to reuse space.
 
-## 4. Sublease (P2P market for locked positions)
+The hook resolves accounts through its `ExtraAccountMetaList`: `Config`, the source owner's page and the destination owner's page (seeded from the first byte of each token account's `owner` field), and the destination owner's `SecretRoot`.
 
-- A tenant lists a locked position at a fixed price in the quote asset; a buyer takes it whole.
-- The position (amount, remaining lease) transfers to the buyer; the tokens never leave the vault and the pool price is unaffected.
-- The buyer's `held_since` resets to the purchase time, so time-held rent restarts for the new tenant.
-- Listing and cancelling are permissionless for the owner; a small market fee is configurable.
+## 5. The hook
 
-## 5. Rent math (Collect Rent): strictly linear
+Token-2022 calls the hook after balances are updated. The hook first checks that it is called by Token-2022 during a real transfer, then applies two rules.
 
-For each distribution period with reward amount `R` (quote asset):
+**Outgoing (source is not exempt):** the source account's balance after the transfer must be at least the sum of its active locks. A lock is active until it is unlocked (section 7) or until `start + max_lock`, whichever comes first.
+
+**Incoming (destination is not exempt):** create a lock entry for the **net** amount received (the amount minus the transfer fee):
 
 ```
-w_i = a_i × t_i
-rent_i = R × w_i / Σ_j w_j
+entry = { amount_net, start_slot, start_time, min_lock, max_lock,
+          secret_index (or none), status: Pending }
 ```
 
-- `a_i`: tokens locked in position `i` (net of transfer fee)
-- `t_i`: seconds position `i` was held within the period
+**Exempt accounts:** the exact vault token accounts of the official pool, never a pool authority. Every CPMM pool shares one authority PDA, so exempting the authority would open any unofficial pool. The LaunchLab vault is recorded at creation. The CPMM vault is recorded once at graduation by a permissionless instruction that verifies the pool created by the migration. Stonk.fun's fee-distribution account is also exempt.
 
-There are no multipliers, tiers or exponentials. Twice the tokens for the same time earns twice the rent, and so does the same tokens for twice the time. Unlocked or free-floating tokens have `w = 0` in RentRoll mode.
+**Unofficial pools cannot bypass the rule:** tokens deposited into any other pool's vault are locked like any wallet's, and every buyer that pool pays receives a new lock.
 
-Two equivalent implementations:
+**Entry limit:** each wallet holds at most 8 active entries. When all 8 are in use, a new amount goes into an overflow entry that unlocks at the latest `start + max_lock` of everything merged into it. Overflow never shortens a lock; it only removes the randomness for that amount.
 
-- **Off-chain (native, simplest)**: the distributor reads position accounts and pays owners directly; the vault itself is excluded as a holder.
-- **On-chain**: if the distributor pays the vault as a regular holder, the vault program streams the received quote tokens to positions with a standard reward-per-weight accumulator (`acc += R × 10^12 / Σw`), using `w = a` integrated over time.
+## 6. Lock length
 
-## 6. Hidden lease durations
+Parameters per launch (public, frozen at creation): `min_lock`, size tiers `(share_ppm_k, max_lock_k)`, `global_max_lock` (at most 21 days), `window_slots`, `window_weight_pct`, `settle_delay` (slots).
 
-- At buy, the tenant commits `h = SHA-256(secret)`.
-- The secret comes from a signature of a fixed message by the tenant's wallet, so the same wallet can always recompute it.
-- After reveal, the program stores the randomness `r` but not the lease. The lease is derived from `SHA-256("rentroll-lease" ‖ r ‖ secret)` with the skewed draw of section 3, so only the tenant knows when the position unlocks.
-- Each position's range `[min_lease, max_lease]` is public, because it depends on the buy size. Its exact end is not.
-- To unlock, the tenant reveals `secret`; the program checks `h` and recomputes the lease.
-- The safety net still applies at `buy_time + max_lease`, with no secret needed.
-- For a Sublease, the seller either reveals the secret at listing or hands it privately to the chosen buyer.
+1. **Size**: `own = amount_net × 10^6 / supply`.
+2. **Pool-wide window**: one volume counter per mint, reset when `window_slots` have passed since the window opened. `effective = max(own, window_volume × window_weight_pct / 100)`. It catches bursts and bundles landing in the same short window. It does not link wallets.
+3. **Range**: `max_lock = interpolate(effective, tiers)`, clamped to `[min_lock, global_max_lock]`.
+4. **Randomness**, without an oracle: `r = SlotHash(start_slot + settle_delay)` (or of the first non-skipped slot after it), read from the SlotHashes sysvar by a permissionless `settle` instruction. If nobody settles before that slot hash leaves the sysvar (about 512 slots), the entry takes `max_lock`. Holding back a settlement can only lengthen a lock.
+5. **Draw**: `u = H(r ‖ key) / 2^256`, then `lock = min_lock + (max_lock − min_lock) × u²`, skewed toward short locks (median at 25% of the range).
+   - With a secret: `key = s_k`, the holder's per-lock secret (section 7).
+   - Without one: `key = mint ‖ owner ‖ entry_id`, and `settle` stores the end time publicly.
+6. **Until settled**, an entry counts as locked for its full `max_lock`.
+7. **Safety net**: every entry is free at `start + max_lock`, with no randomness, secret or keeper needed.
 
-## 7. Reference implementation
+A slot leader could bias one slot hash by skipping its slot. It cannot choose a lock length, and the bias only matters to a holder who is that leader.
 
-A compiled SBF proof-of-concept of the vault wrapper (Anchor 0.31) exists: CPIs to LaunchLab `buy_exact_in` and CPMM `swap_base_input` generated from Raydium's public IDLs, lease settlement, accumulator-based rent, sell-from-vault and withdraw. It is not deployed, not audited, and has not been tested against live pools.
+## 7. Secret lock lengths
 
-## 8. Open questions
+1. **Master secret**: the wallet signs a fixed, domain-separated message (`RentRoll lock secret for <mint>. Sign only on stonkfun.xyz.`). `master = SHA-256(signature)`. Ed25519 signatures are deterministic, so the same wallet can always recompute it. Wallets that cannot do this keep a random master secret in a local, exportable backup.
+2. **Per-lock secrets**: `s_k = H(master ‖ k)` and commitments `c_k = H(s_k)` for `k = 0 … 1023`.
+3. **Commitment**: the wallet registers `R = MerkleRoot(c_0 … c_1023)` in its `SecretRoot` **before** buying. Each new lock entry uses the next unused index `k`, tracked in `SecretRoot`. When the indexes run out, new locks are public until the wallet registers a new root.
+4. **Why the holder cannot cheat**: `c_k` is fixed before the transfer and `r` comes from a later slot, so the holder cannot pick a secret that gives a short lock.
+5. **Unlock**: the holder calls `unlock(entry, s_k, proof)`. The program checks `H(s_k)` against `R`, recomputes the length, checks that it has elapsed, and marks the entry free. Only that lock's length becomes public, and only once it is already over.
+6. **No root registered**: the lock is public (section 6, step 5).
 
-1. Do LaunchLab and CPMM accept an output token account owned by a PDA that is not the payer? The public IDLs only constrain the mint. To be confirmed on a mainnet fork.
-2. Do the distributor's current eligibility rules include or exclude program-owned token accounts?
-3. Do Stonk.fun's indexers count CPI-routed trades like direct ones (volume, charts, fee ledger)?
-4. Which per-launch parameters (tiers, window, global maximum) does Stonk.fun want to expose to creators?
-5. How is the unlock-fee rebate funded and capped?
+What others can see: each entry's amount, start and range. What they cannot see: when a secret lock ends, until its holder moves the tokens.
+
+## 8. Reward split
+
+Stonk.fun's distributor already pays the reward tax to holders in the quote asset. In RentRoll mode it weights each holder by **balance × time held** over the distribution period:
+
+```
+w_i = Σ balance_i(t) × Δt
+reward_i = R × w_i / Σ_j w_j
+```
+
+Exempt vaults and program-owned accounts are excluded. The weighting is linear: no multipliers, tiers or exponentials. Splitting a buy across many wallets earns nothing extra.
+
+## 9. Selling a locked position
+
+1. The holder lists an entry at a price in the quote asset and approves the RentRoll program as delegate for that amount.
+2. A buyer calls `buy_listing`. The program marks the entry in the seller's page for this buyer and amount, then transfers the tokens as delegate. The hook finds the mark and **moves the entry** (amount, start, range, randomness) to the buyer instead of creating a new lock.
+3. For a secret lock, the seller either reveals `s_k` in the listing (the end becomes public) or sends it privately to a named buyer, who checks it against the seller's commitment.
+4. Tokens never touch a pool, so the price does not move.
+
+Native wallet "Send" buttons do not pass hook accounts. Transfers and listings go through the Stonk.fun token page.
+
+## 10. What Stonk.fun runs
+
+1. A "RentRoll" platform config: reward launch with the RentRoll hook.
+2. UI flows: enable secret locks (sign, register root), buy (prepend page instruction when needed), unlock, send, list and buy positions.
+3. A keeper: settles entries, keeps page headroom, records the CPMM vault at graduation.
+4. Distributor weighting by balance × time held, with exclusions.
+
+## 11. Open questions
+
+1. Will Raydium enshrine an audited RentRoll hook in LaunchLab and CPMM (section 2)?
+2. Does Stonk.fun's distributor currently pay program-owned accounts?
+3. Compute cost of the hook on LaunchLab and CPMM swaps, within limits shared with Raydium's own accounts.
+4. Exact deterministic seeds of LaunchLab and CPMM vault accounts.
+5. Which wallets sign the secret message deterministically (Phantom, Solflare, Backpack, Ledger, MPC wallets).
+6. Page sizing and rent per launch.
+7. Whether withdrawing withheld transfer fees invokes the hook on Stonk.fun's current flow.
