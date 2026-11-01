@@ -7,7 +7,7 @@ RentRoll is a token-level rule for Stonk.fun launches. It works on both reward l
 - **Every incoming transfer is locked.** Any buy, from any route, and any wallet-to-wallet send creates a lock on the amount received. Locked tokens cannot be sold or sent until the lock ends.
 - **Each lock length is random and secret.** It is drawn from public randomness and a secret committed in advance by the holder, so only the holder can compute when it ends. Its possible range is public; its exact end is not.
 - **Bigger buys get wider ranges.** The maximum lock scales with the buy's share of supply, measured against a pool-wide rolling window.
-- **Long locks get a bonus.** Past a minimum lock time, every extra day adds a bonus in the coin's own tokens, paid when the lock ends, from a reserve the creator sets aside at launch.
+- **Long locks get a bonus.** Past a minimum lock time, every extra day adds a bonus in the coin's own tokens, paid when the lock ends. The bonus comes from a reserve carved out of the supply at launch, so the creator pays nothing extra.
 - **Stonk.fun's reward tax is untouched.** The creator turns the buy/sell reward tax on or off as usual, and Stonk.fun distributes it exactly as it does today. RentRoll works the same either way.
 - **Locks can be transferred.** A holder can sell a locked position to another wallet, which inherits the remaining lock.
 
@@ -34,11 +34,13 @@ RentRoll requires:
 2. **LaunchLab**: a TransferHook option on `initialize_with_token_2022`, limited to enshrined hook programs, with extras forwarded in buy, sell and migration. It must work with and without TransferFeeConfig, so it fits both reward and standard launches.
 3. **Graduation**: automatic `support_mint` and `support_hook` registration for RentRoll mints when they migrate to CPMM.
 4. **Deterministic, documented vault addresses** for LaunchLab and CPMM pools, so the hook can exempt exact accounts (section 5).
-5. **Aggregators**: Jupiter routing for enshrined-hook mints. Until then, RentRoll tokens trade on Stonk.fun and Raydium only.
+5. **Bonus reserve at creation**: a set share of supply minted straight to the `BonusVault` instead of to the curve (section 9). LaunchLab's existing vesting allocation could serve if it can name a program-owned beneficiary and release tokens before graduation.
+6. **Aggregators**: Jupiter routing for enshrined-hook mints. Until then, RentRoll tokens trade on Stonk.fun and Raydium only.
 
 ## 3. Mint
 
 - Token-2022, 1B supply, 6 decimals.
+- Supply split at creation: `bonus_reserve` (for example 5 to 10%) to the `BonusVault`, the rest to the LaunchLab curve.
 - Extensions: TransferHook (the RentRoll program), MetadataPointer and TokenMetadata. Reward launches also carry TransferFeeConfig (Stonk.fun's existing reward tax); standard launches do not.
 - Mint authority and freeze authority set to none.
 - The hook program is immutable after audit, or held by a multisig behind a public timelock. Per-launch parameters are frozen at creation.
@@ -115,7 +117,7 @@ On a reward launch, Stonk.fun's distributor keeps working exactly as it does now
 
 A long lock is not just a cost: past a threshold, it pays a bonus.
 
-**Reserve.** At launch, the creator sets aside a share of supply (`bonus_reserve`, within a minimum and maximum set by Stonk.fun, for example 3 to 5%) in the `BonusVault`, either from a creator allocation or from tokens bought at launch and deposited. Anyone can add to it. Nobody can withdraw from it: it only pays bonuses.
+**Reserve.** The reserve is part of the launch. At creation, a share of the total supply (`bonus_reserve`, within a range set by Stonk.fun, for example 5 to 10%) is minted straight into the `BonusVault`, and the curve sells the rest. The creator does not fund it, buy it or deposit anything. Anyone can add to it. Nobody can withdraw from it: it only pays bonuses.
 
 **Parameters per launch** (public, frozen at creation): `bonus_threshold` (for example 3 days), `bonus_rate` (share of the locked amount per day beyond the threshold, for example 1%), `bonus_cap_mult` (for example 5: a claim can take at most 5 × its amount's share of supply, as a share of the vault), `bonus_claim_window` (for example 30 days after unlock).
 
@@ -152,7 +154,7 @@ Native wallet "Send" buttons do not pass hook accounts. Transfers and listings g
 
 ## 11. What Stonk.fun runs
 
-1. A "RentRoll" option on both launch types: reward and standard, each with the RentRoll hook and a bonus reserve funded at launch.
+1. A "RentRoll" option on both launch types: reward and standard, each with the RentRoll hook and a bonus reserve carved out of supply at creation.
 2. UI flows: enable secret locks (sign, register root), buy (prepend page instruction when needed), unlock and claim the bonus, send, list and buy positions.
 3. A keeper: settles entries, keeps page headroom, records the CPMM vault at graduation.
 
@@ -166,4 +168,4 @@ Nothing changes in Stonk.fun's reward distribution.
 4. Which wallets sign the secret message deterministically (Phantom, Solflare, Backpack, Ledger, MPC wallets).
 5. Page sizing and rent per launch.
 6. On reward launches: whether withdrawing withheld transfer fees invokes the hook on Stonk.fun's current flow.
-7. How a creator funds the bonus reserve on LaunchLab: a creator allocation, or tokens bought at launch and deposited.
+7. How LaunchLab mints the bonus reserve at creation: a direct share to the `BonusVault`, or its vesting allocation with the vault as beneficiary.
