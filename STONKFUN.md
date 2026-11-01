@@ -7,7 +7,7 @@ RentRoll is a token-level rule for Stonk.fun launches. It works on both reward l
 - **Every incoming transfer is locked.** Any buy, from any route, and any wallet-to-wallet send creates a lock on the amount received. Locked tokens cannot be sold or sent until the lock ends.
 - **Each lock length is random and secret.** It is drawn from public randomness and a secret committed in advance by the holder, so only the holder can compute when it ends. Its possible range is public; its exact end is not.
 - **Bigger buys get wider ranges.** The maximum lock scales with the buy's share of supply, measured against a pool-wide rolling window.
-- **Long locks get a bonus.** Past a minimum lock time, every extra day adds a bonus in the coin's own tokens, paid when the lock ends. The bonus comes from a reserve carved out of the supply at launch, so the creator pays nothing extra.
+- **Long locks get a bonus.** Past a minimum lock time, every extra day adds a bonus in the coin's own tokens, paid when the lock ends. The bonus comes from a reserve carved out of the supply at launch, so the creator pays nothing extra. Bonuses scale with what is left in the reserve, so it never runs dry.
 - **Stonk.fun's reward tax is untouched.** The creator turns the buy/sell reward tax on or off as usual, and Stonk.fun distributes it exactly as it does today. RentRoll works the same either way.
 - **Locks can be transferred.** A holder can sell a locked position to another wallet, which inherits the remaining lock.
 
@@ -119,20 +119,32 @@ A long lock is not just a cost: past a threshold, it pays a bonus.
 
 **Reserve.** The reserve is part of the launch. At creation, a share of the total supply (`bonus_reserve`, within a range set by Stonk.fun, for example 5 to 10%) is minted straight into the `BonusVault`, and the curve sells the rest. The creator does not fund it, buy it or deposit anything. Anyone can add to it. Nobody can withdraw from it: it only pays bonuses.
 
-**Parameters per launch** (public, frozen at creation): `bonus_threshold` (for example 3 days), `bonus_rate` (share of the locked amount per day beyond the threshold, for example 1%), `bonus_cap_mult` (for example 5: a claim can take at most 5 × its amount's share of supply, as a share of the vault), `bonus_claim_window` (for example 30 days after unlock).
+**Parameters per launch** (public, frozen at creation): `bonus_threshold` (for example 3 days), `bonus_rate` (share of the locked amount per day beyond the threshold, for example 1%), `bonus_cap_mult` (for example 5: a claim can take at most 5 × its amount's share of supply, as a share of the vault), `bonus_claim_window` (for example 30 days after unlock), `listing_fee` (share of a sold position sent to the reserve, for example 2%). The reserve's starting balance `reserve_start` is recorded at creation.
 
 **Amount.** For an entry with drawn lock length `L`:
 
 ```
 days_over = max(0, L − bonus_threshold) / 1 day
-bonus = amount_net × bonus_rate × days_over
+level = min(1, vault_balance / reserve_start)
+bonus = amount_net × bonus_rate × days_over × level
 cap   = vault_balance × bonus_cap_mult × amount_net / supply
 paid  = min(bonus, cap)
 ```
 
-Below the threshold there is no bonus. Above it, the bonus grows linearly with each extra day. A 21-day lock with the example values pays up to 18% of the locked amount.
+Below the threshold there is no bonus. Above it, the bonus grows linearly with each extra day. With a full reserve and the example values, a 21-day lock pays up to 18% of the locked amount.
 
-The cap is proportional to the amount, so splitting a buy cannot get around it, and no single claim can drain the reserve. As the reserve shrinks, payouts shrink with it.
+**The reserve never runs dry.** Every bonus is scaled by the reserve's current level: full reserve, full bonus; half reserve, half bonus. Each payout takes a share of what is left, so the reserve shrinks more and more slowly and never reaches zero. When it refills, bonuses rise again, up to the full rate.
+
+**Refills**, all from inside the system, with no change to Stonk.fun's tax and nothing paid by the creator:
+
+- `listing_fee` on every locked-position sale (section 10);
+- bonuses not claimed within `bonus_claim_window` stay in the reserve;
+- entries that time out or overflow earn nothing, so nothing leaves for them;
+- anyone can add tokens.
+
+With payouts that shrink as the reserve shrinks and refills that grow with activity, the reserve settles where what comes in matches what goes out. There is no early exit from a lock: it would turn the lock into a priced-in strategy instead of a commitment.
+
+The cap is proportional to the amount, so splitting a buy cannot get around it, and no single claim can take a large share of the reserve.
 
 **Claim.** The holder calls `claim_bonus(entry)` once the lock has ended: with a secret lock, together with `unlock` (section 7), which reveals the length at that point; with a public lock, after its stored end. The bonus is paid unlocked. Each entry can claim once.
 
@@ -140,12 +152,10 @@ The cap is proportional to the amount, so splitting a buy cannot get around it, 
 
 **Splitting does not pay.** Smaller buys draw from shorter ranges, so splitting one buy across many wallets means fewer days past the threshold and a smaller total bonus.
 
-**Empty vault.** When the reserve runs out, bonuses stop and the lock keeps working as before.
-
 ## 10. Selling a locked position
 
 1. The holder lists an entry at a price in the quote asset and approves the RentRoll program as delegate for that amount.
-2. A buyer calls `buy_listing`. The program marks the entry in the seller's page for this buyer and amount, then transfers the tokens as delegate. The hook finds the mark and **moves the entry** (amount, start, range, randomness) to the buyer instead of creating a new lock.
+2. A buyer calls `buy_listing`. The program marks the entry in the seller's page for this sale, then transfers the tokens as delegate: `listing_fee` of them to the `BonusVault`, the rest to the buyer. The hook finds the mark, lets the marked tokens leave the seller, and **moves the entry** (remaining amount, start, range, randomness) to the buyer instead of creating a new lock.
 3. For a secret lock, the seller either reveals `s_k` in the listing (the end becomes public) or sends it privately to a named buyer, who checks it against the seller's commitment.
 4. The buyer inherits the entry's future bonus.
 5. Tokens never touch a pool, so the price does not move.
